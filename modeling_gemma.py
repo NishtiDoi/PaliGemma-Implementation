@@ -5,7 +5,10 @@ from torch.nn import CrossEntropyLoss
 import math
 from modelling_siglip import SiglipVisionConfig, SiglipVisionModel
 
-class KVCache():
+# This code defines the complete architecture for PaliGemma, a Vision-Language Model (VLM). 
+# It connects a Vision Transformer (SigLIP) to a Large Language Model (Gemma) so the model can "see" images and talk about them.
+
+class KVCache(): # Stores Key and Value tensors from previous time steps during text generation so the model doesn't have to recompute them, making inference much faster.
 
     def __init__(self) -> None:
         self.key_cache: List[torch.Tensor] = []
@@ -37,19 +40,21 @@ class KVCache():
         # ... and then we return all the existing keys + the new ones.
         return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
-class GemmaConfig():
+class GemmaConfig(): # Stores hyperparameters for the Gemma language model
 
     def __init__(
         self,
         vocab_size,
-        hidden_size,
-        intermediate_size,
-        num_hidden_layers,
-        num_attention_heads,
-        num_key_value_heads,
-        head_dim=256,
-        max_position_embeddings=8192,
-        rms_norm_eps=1e-6,
+        hidden_size, # embedding dimension 
+        intermediate_size, # MLP expansion which is usually 4x hidden
+        num_hidden_layers, # number of decoder blocks stacked 
+        num_attention_heads, # total Q heads
+        num_key_value_heads, # number of K/V heads (if using GQA, otherwise same as num_attention_heads)
+        head_dim=256, # size per dim
+        max_position_embeddings=8192, # max context length 
+        
+        # training ke liye 
+        rms_norm_eps=1e-6, 
         rope_theta=10000.0,
         attention_bias=False,
         attention_dropout=0.0,
@@ -71,17 +76,18 @@ class GemmaConfig():
         self.attention_dropout = attention_dropout
         self.pad_token_id = pad_token_id
 
-class PaliGemmaConfig():
+class PaliGemmaConfig(): # Stores hyperparameters for the entire PaliGemma model, including both the vision and language components. (VLM ka config)
 
     def __init__(
         self,
-        vision_config=None,
-        text_config=None,
-        ignore_index=-100,
-        image_token_index=256000,
-        vocab_size=257152,
-        projection_dim=2048,
-        hidden_size=2048,
+        vision_config=None, # passed to the SiglipVisionModel which processes images
+        text_config=None, # passed to the GemmaConfig which processes text and generates output
+        ignore_index=-100, # index to ignore when computing the loss
+        image_token_index=256000, # token index for image tokens
+        vocab_size=257152, # size of the vocabulary
+        
+        projection_dim=2048, # dimension of the projection layer ALSO SigLIP output ≠ Gemma input by default.
+        hidden_size=2048, # size of the hidden layers
         pad_token_id=None,
         **kwargs,
     ):
@@ -105,23 +111,23 @@ class PaliGemmaConfig():
         self.vision_config.projection_dim = projection_dim
 
 
-class GemmaRMSNorm(nn.Module):
+class GemmaRMSNorm(nn.Module): # a normalisation layer used to stabilise the hidden states, ensuring values dont explode as they pass
+    #Standard LayerNorm centers the data by subtracting the mean ($\mu$) and then scales it. RMSNorm skips the centering step, which reduces computational overhead by about 40% while providing similar stabilization benefits for deep networks.
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.zeros(dim))
+        self.eps = eps # A very small constant ($1 x 10^-6 added to the denominator to prevent division by zero.
+        self.weight = nn.Parameter(torch.zeros(dim)) # A learnable parameter (scaling factor) initialized to zeros. In Gemma's specific implementation, this weight is applied as $(1 + \text{weight})$, which is why it starts at zero (making the initial multiplier $1.0$).
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) # Calculates the mean of the squares of the hidden states along the last dimension.
+                                                                           # Then it takes the reciprocal of the square root of this mean (plus epsilon for stability) to get the normalization factor. Finally, it multiplies the input tensor x by this normalization factor to produce the normalized output. 
 
     def forward(self, x):
-        output = self._norm(x.float())
-        # Llama does x.to(float16) * w whilst Gemma is (x * w).to(float16)
-        # See https://github.com/huggingface/transformers/pull/29402
+        output = self._norm(x.float()) # The input is cast to float32 for precision during the calculation of squares and square roots, avoiding numerical instability.
         output = output * (1.0 + self.weight.float())
         return output.type_as(x)
 
-class GemmaRotaryEmbedding(nn.Module):
+class GemmaRotaryEmbedding(nn.Module): # RoPE (Rotary Positional Embedding), injects positional information by rotating the Query and Key vectors, helping the model understand the relative order of tokens.
     def __init__(self, dim, max_position_embeddings=2048, base=10000, device=None):
         super().__init__()
 
@@ -172,35 +178,105 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     return q_embed, k_embed
 
 
-class GemmaMLP(nn.Module):
+class GemmaMLP(nn.Module): # A feed-forward network that processes each token individually to refine its features.
     def __init__(self, config):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
+        
+        # gate_proj: Projects input to a higher dimension to act as a "filter" or "gate"
         self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        
+        # up_proj: Parallel projection to a higher dimension that carries the "content"
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        
+        # down_proj: Projects the merged high-dim representation back to the original model dimension
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
 
     def forward(self, x):
-        # Equivalent to:
-        # y = self.gate_proj(x) # [Batch_Size, Seq_Len, Hidden_Size] -> [Batch_Size, Seq_Len, Intermediate_Size]
-        # y = torch.gelu(y, approximate="tanh") # [Batch_Size, Seq_Len, Intermediate_Size]
-        # j = self.up_proj(x) # [Batch_Size, Seq_Len, Hidden_Size] -> [Batch_Size, Seq_Len, Intermediate_Size]
-        # z = y * j # [Batch_Size, Seq_Len, Intermediate_Size]
-        # z = self.down_proj(z) # [Batch_Size, Seq_Len, Intermediate_Size] -> [Batch_Size, Seq_Len, Hidden_Size]
+        # 1. gate_proj(x): Linear expansion
+        # 2. nn.functional.gelu(..., approximate="tanh"): Applies GELU activation to the gate
+        # 3. ... * self.up_proj(x): Element-wise multiplication (the "Gated Linear Unit" mechanism)
+        # 4. self.down_proj(...): Linear contraction back to hidden_size
+        
+        # This implementation uses the GeGLU activation variant common in modern LLMs
         return self.down_proj(nn.functional.gelu(self.gate_proj(x), approximate="tanh") * self.up_proj(x))
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
+    """
+    Broadcasts KV heads to match the number of Query heads.
+    Example: If you have 8 KV heads and 32 Query heads, n_rep would be 4.
+    """
     batch, num_key_value_heads, slen, head_dim = hidden_states.shape
+    
+    # If the number of KV heads already matches Query heads, do nothing.
     if n_rep == 1:
         return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    
+    # 1. Add a 'singleton' dimension at index 2 (None) to act as a placeholder for repetition.
+    # New Shape: [batch, num_key_value_heads, 1, slen, head_dim]
+    hidden_states = hidden_states[:, :, None, :, :]
+    
+    # 2. Use .expand() to virtually repeat the KV heads n_rep times.
+    # This is memory efficient because it doesn't allocate new memory for copies.
+    # New Shape: [batch, num_key_value_heads, n_rep, slen, head_dim]
+    hidden_states = hidden_states.expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    
+    # 3. Collapse the num_key_value_heads and n_rep dimensions together.
+    # Final Shape: [batch, num_key_value_heads * n_rep, slen, head_dim]
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
-class GemmaAttention(nn.Module):
+class GemmaAttention(nn.Module): #Multi-head grouped query attention (GQA) with rotary position embeddings (RoPE).
+    """
+    This is the core attention mechanism for the Gemma language model. It differs
+    from standard multi-head attention (as used in SigLIP) in two important ways:
+
+    1. **Grouped Query Attention (GQA):** Instead of one K/V head per Q head,
+       multiple Q heads share a single K/V head. This significantly reduces
+       memory usage and speeds up inference, especially with a KV cache.
+
+       Example with typical Gemma config:
+           num_attention_heads (Q)  = 8   (8 query heads)
+           num_key_value_heads (KV) = 1   (1 key/value head shared by all)
+           num_key_value_groups     = 8   (each KV head serves 8 Q heads)
+
+    2. **Rotary Position Embeddings (RoPE):** Instead of adding position info
+       to the input (like SigLIP's position embeddings), RoPE rotates the Q
+       and K vectors based on their position. This lets the model generalise
+       to sequence lengths it wasn't explicitly trained on.
+
+    Attributes:
+        layer_idx (int): Index of this layer in the decoder stack. Used to
+            read/write the correct slot in the KV cache.
+        num_heads (int): Number of query attention heads.
+        num_key_value_heads (int): Number of key/value heads (fewer than Q heads in GQA).
+        num_key_value_groups (int): How many Q heads share each KV head.
+            Computed as ``num_heads // num_key_value_heads``.
+        head_dim (int): Dimensionality of each attention head.
+        is_causal (bool): Always True — Gemma is a causal (left-to-right) decoder.
+        q_proj: Projects hidden states to query vectors (full num_heads size).
+        k_proj: Projects hidden states to key vectors (smaller num_key_value_heads size).
+        v_proj: Projects hidden states to value vectors (smaller num_key_value_heads size).
+        o_proj: Projects concatenated head outputs back to hidden_size.
+        rotary_emb: RoPE module that computes cos/sin rotation coefficients.
+    """
 
     def __init__(self, config: GemmaConfig, layer_idx: Optional[int] = None):
+        """Initialises GemmaAttention with projections and RoPE.
+
+        Args:
+            config (GemmaConfig): Model hyperparameters. Key fields used:
+                - ``hidden_size``: Input/output feature dimension.
+                - ``num_attention_heads``: Number of Q heads.
+                - ``num_key_value_heads``: Number of K/V heads (GQA).
+                - ``head_dim``: Per-head feature dimension.
+                - ``rope_theta``: Base frequency for RoPE (default 10000).
+                - ``attention_bias``: Whether linear projections use bias.
+            layer_idx (int, optional): Position of this layer in the decoder
+                stack. Required when using a KV cache so each layer writes
+                to the correct cache slot.
+        """
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -210,17 +286,28 @@ class GemmaAttention(nn.Module):
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.num_key_value_heads = config.num_key_value_heads
+
+        # How many Q heads share each single KV head.
+        # e.g. 8 Q heads / 1 KV head = 8 groups
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
+
         self.max_position_embeddings = config.max_position_embeddings
         self.rope_theta = config.rope_theta
-        self.is_causal = True
+        self.is_causal = True  # Gemma is a causal decoder — no peeking at future tokens
 
-        assert self.hidden_size % self.num_heads == 0            
+        # Sanity check: hidden_size must divide evenly across heads
+        assert self.hidden_size % self.num_heads == 0
 
+        # --- Projection layers ---
+        # Q gets the full num_heads allocation
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias)
+        # K and V only get num_key_value_heads — this is the GQA saving
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=config.attention_bias)
+        # Output projection merges all heads back to hidden_size
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=config.attention_bias)
+
+        # RoPE: generates cos/sin rotation coefficients per position
         self.rotary_emb = GemmaRotaryEmbedding(
             self.head_dim,
             max_position_embeddings=self.max_position_embeddings,
@@ -235,43 +322,136 @@ class GemmaAttention(nn.Module):
         kv_cache: Optional[KVCache] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size() # [Batch_Size, Seq_Len, Hidden_Size]
+        """Computes grouped query attention with RoPE and optional KV caching.
+
+        The forward pass has six logical stages:
+          1. Project hidden states into Q, K, V vectors.
+          2. Reshape into per-head format.
+          3. Apply RoPE to Q and K (inject position information).
+          4. Update and retrieve the KV cache (if provided).
+          5. Expand K/V heads to match Q head count (GQA).
+          6. Compute scaled dot-product attention and project output.
+
+        Args:
+            hidden_states (torch.Tensor): Input token representations of shape
+                ``(batch_size, seq_len, hidden_size)``. Contains both image
+                patch embeddings and text token embeddings interleaved.
+            attention_mask (torch.Tensor, optional): Additive mask of shape
+                ``(batch_size, num_heads, seq_len_q, seq_len_kv)``.
+                ``0`` means attend, ``-inf`` means block. Applied before
+                softmax so masked positions get ~0 probability.
+            position_ids (torch.LongTensor, optional): Token positions of shape
+                ``(batch_size, seq_len)``. Used by RoPE to compute the correct
+                rotation angle for each position.
+            kv_cache (KVCache, optional): Cache of past K/V tensors for fast
+                autoregressive generation. If provided, new K/V states are
+                appended to the cache and the full history is returned.
+            **kwargs: Absorbed for API compatibility.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]:
+                - **attn_output** ``(batch_size, seq_len, hidden_size)``:
+                  Attention output projected back to hidden size.
+                - **attn_weights** ``(batch_size, num_heads, seq_len_q, seq_len_kv)``:
+                  Softmaxed attention scores (useful for visualisation/debugging).
+        """
+
+        bsz, q_len, _ = hidden_states.size()  # [Batch_Size, Seq_Len, Hidden_Size]
+
+        # ------------------------------------------------------------------ #
+        # STAGE 1 — Project to Q, K, V                                       #
+        # ------------------------------------------------------------------ #
+        # Q gets projected to the full num_heads size
         # [Batch_Size, Seq_Len, Num_Heads_Q * Head_Dim]
         query_states = self.q_proj(hidden_states)
+
+        # K and V are projected to the smaller num_key_value_heads size (GQA)
         # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
         key_states = self.k_proj(hidden_states)
-        # [Batch_Size, Seq_Len, Num_Heads_KV * Head_Dim]
         value_states = self.v_proj(hidden_states)
-        # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim]
+
+        # ------------------------------------------------------------------ #
+        # STAGE 2 — Reshape to per-head format                               #
+        # ------------------------------------------------------------------ #
+        # Split the last dimension into (num_heads, head_dim) then move
+        # num_heads to dimension 1 so each head can be processed in parallel.
+
+        # [Batch_Size, Seq_Len, Num_Heads_Q * Head_Dim]
+        #   -> [Batch_Size, Seq_Len, Num_Heads_Q, Head_Dim]
+        #   -> [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim]
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Same reshape for K and V but with num_key_value_heads (smaller)
         # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        # [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
-        # [Batch_Size, Seq_Len, Head_Dim], [Batch_Size, Seq_Len, Head_Dim]
+        # ------------------------------------------------------------------ #
+        # STAGE 3 — Apply RoPE to inject position information                #
+        # ------------------------------------------------------------------ #
+        # RoPE computes a rotation matrix for each position.
+        # cos and sin: [Batch_Size, Seq_Len, Head_Dim]
         cos, sin = self.rotary_emb(value_states, position_ids, seq_len=None)
-        # [Batch_Size, Num_Heads_Q, Seq_Len, Head_Dim], [Batch_Size, Num_Heads_KV, Seq_Len, Head_Dim]
+
+        # Rotate Q and K vectors by their respective position angles.
+        # K is rotated too (not just Q) so relative position is encoded in Q·K^T.
+        # Shapes unchanged: Q still [Batch, Num_Heads_Q, Seq_Len, Head_Dim]
+        #                   K still [Batch, Num_Heads_KV, Seq_Len, Head_Dim]
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
+        # ------------------------------------------------------------------ #
+        # STAGE 4 — KV Cache update                                          #
+        # ------------------------------------------------------------------ #
+        # During generation, instead of recomputing K/V for all past tokens,
+        # we append the new token's K/V to the cache and retrieve the full
+        # history. This is the key to fast autoregressive inference.
+        #
+        # Prefill (first pass):  cache is empty → just stores K/V
+        # Decode (subsequent):   new K/V appended → returns full history
         if kv_cache is not None:
+            # key_states and value_states now contain ALL tokens (past + current)
+            # shape: [Batch_Size, Num_Heads_KV, Full_Seq_Len, Head_Dim]
             key_states, value_states = kv_cache.update(key_states, value_states, self.layer_idx)
 
-        # Repeat the key and values to match the number of heads of the query
+        # ------------------------------------------------------------------ #
+        # STAGE 5 — Expand KV heads to match Q heads (GQA)                  #
+        # ------------------------------------------------------------------ #
+        # Q has num_heads heads, but K/V only have num_key_value_heads.
+        # repeat_kv tiles each KV head num_key_value_groups times so the
+        # shapes are compatible for the matmul.
+        #
+        # Example: 1 KV head, 8 Q heads → KV head is repeated 8 times
+        # [Batch, Num_Heads_KV, Seq_Len, Head_Dim]
+        #   -> [Batch, Num_Heads_Q, Seq_Len, Head_Dim]
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
-        # Perform the calculation as usual, Q * K^T / sqrt(head_dim). Shape: [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
+
+        # ------------------------------------------------------------------ #
+        # STAGE 6 — Scaled dot-product attention                             #
+        # ------------------------------------------------------------------ #
+
+        # Q · K^T / sqrt(head_dim)
+        # [Batch, Num_Heads_Q, Seq_Len_Q, Head_Dim] x [Batch, Num_Heads_Q, Head_Dim, Seq_Len_KV]
+        # -> [Batch, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
+        # Each row is a query token's raw attention score against every key token.
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
         assert attention_mask is not None
+        # Add the mask (0 = attend, -inf = block). Positions with -inf become
+        # ~0 after softmax, effectively preventing attention to those tokens.
         attn_weights = attn_weights + attention_mask
 
-        # Apply the softmax
+        # Softmax across the key dimension (dim=-1) — converts raw scores to
+        # probabilities. Done in float32 for numerical stability, then cast back.
         # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV]
         attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        # Apply the dropout
+
+        # Dropout applied to attention weights during training only
         attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        # Multiply by the values. [Batch_Size, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV] x [Batch_Size, Num_Heads_KV, Seq_Len_KV, Head_Dim] -> [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim]
+
+        # Weighted sum of value vectors using attention probabilities.
+        # [Batch, Num_Heads_Q, Seq_Len_Q, Seq_Len_KV] x [Batch, Num_Heads_Q, Seq_Len_KV, Head_Dim]
+        # -> [Batch, Num_Heads_Q, Seq_Len_Q, Head_Dim]
         attn_output = torch.matmul(attn_weights, value_states)
 
         if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
@@ -279,16 +459,22 @@ class GemmaAttention(nn.Module):
                 f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
                 f" {attn_output.size()}"
             )
-        # Make sure the sequence length is the second dimension. # [Batch_Size, Num_Heads_Q, Seq_Len_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim]
+
+        # Move heads back to 3rd dimension before merging
+        # [Batch, Num_Heads_Q, Seq_Len_Q, Head_Dim] -> [Batch, Seq_Len_Q, Num_Heads_Q, Head_Dim]
         attn_output = attn_output.transpose(1, 2).contiguous()
-        # Concatenate all the heads together. [Batch_Size, Seq_Len_Q, Num_Heads_Q, Head_Dim] -> [Batch_Size, Seq_Len_Q, Num_Heads_Q * Head_Dim]
+
+        # Merge all heads into a single vector per token position
+        # [Batch, Seq_Len_Q, Num_Heads_Q, Head_Dim] -> [Batch, Seq_Len_Q, Num_Heads_Q * Head_Dim]
         attn_output = attn_output.view(bsz, q_len, -1)
-        # Multiply by W_o. [Batch_Size, Seq_Len_Q, Hidden_Size]
+
+        # Final linear projection to mix information across heads
+        # [Batch, Seq_Len_Q, Num_Heads_Q * Head_Dim] -> [Batch, Seq_Len_Q, Hidden_Size]
         attn_output = self.o_proj(attn_output)
 
         return attn_output, attn_weights
 
-class GemmaDecoderLayer(nn.Module):
+class GemmaDecoderLayer(nn.Module):# A single Transformer block combining Attention and MLP.
 
     def __init__(self, config: GemmaConfig, layer_idx: int):
         super().__init__()
@@ -332,7 +518,7 @@ class GemmaDecoderLayer(nn.Module):
 
         return hidden_states
 
-class GemmaModel(nn.Module):
+class GemmaModel(nn.Module): # The main model that orchestrates the vision and language components.
 
     def __init__(self, config: GemmaConfig):
         super().__init__()
@@ -378,19 +564,96 @@ class GemmaModel(nn.Module):
         # [Batch_Size, Seq_Len, Hidden_Size]
         return hidden_states
 
-class GemmaForCausalLM(nn.Module):
+class GemmaForCausalLM(nn.Module): #Gemma language model with a causal language modelling head.
+    """
+    "Causal LM" means the model predicts the next token given all previous
+    tokens — it cannot look ahead. This is how all autoregressive text
+    generation works: GPT, LLaMA, Gemma, etc.
+
+    This class is a thin wrapper that adds one extra layer on top of
+    GemmaModel: a linear projection called lm_head that converts the
+    model's internal hidden vectors into a probability distribution over
+    the entire vocabulary.
+
+    Architecture:
+        inputs_embeds (merged image + text vectors)
+               │
+               ▼
+          GemmaModel                  ← N decoder layers (attention + MLP)
+               │
+               ▼  [Batch, Seq_Len, Hidden_Size]
+            lm_head                   ← Linear(hidden_size → vocab_size)
+               │
+               ▼  [Batch, Seq_Len, Vocab_Size]
+             logits                   ← raw score for every token at every position
+
+    The logit at position i represents "given tokens 0..i, how likely is
+    each vocabulary token to come next?" The highest scoring token is
+    typically chosen as the next generated token.
+
+    Weight tying:
+        lm_head.weight is shared with the input token embedding matrix
+        (embed_tokens). This is a standard technique — the same matrix
+        that maps token IDs → vectors on the way in also maps hidden
+        vectors → token scores on the way out. It reduces parameters
+        and often improves performance.
+
+    Attributes:
+        model (GemmaModel): The core transformer decoder stack.
+        vocab_size (int): Number of tokens in the vocabulary.
+        lm_head (nn.Linear): Projects hidden states to vocabulary logits.
+            No bias, and its weight is tied to embed_tokens.
+    """
 
     def __init__(self, config):
+        """Initialises the model, decoder stack, and lm_head projection.
+
+        Args:
+            config (GemmaConfig): Hyperparameters. Key fields:
+                - ``hidden_size``: Dimension of internal token representations.
+                - ``vocab_size``: Number of tokens in the vocabulary.
+                  lm_head output size matches this exactly.
+        """
         super().__init__()
         self.config = config
+
+        # The full transformer decoder stack (embeddings + N decoder layers + norm)
         self.model = GemmaModel(config)
+
         self.vocab_size = config.vocab_size
+
+        # The language modelling head: converts each hidden vector into a
+        # score for every token in the vocabulary.
+        # hidden_size → vocab_size, no bias (standard for LM heads)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def get_input_embeddings(self):
+        """Returns the token embedding table from the underlying GemmaModel.
+
+        Used by PaliGemmaForConditionalGeneration to convert input_ids into
+        embedding vectors before merging with image features.
+
+        Returns:
+            nn.Embedding: The embed_tokens layer of shape
+            ``(vocab_size, hidden_size)``.
+        """
         return self.model.embed_tokens
-    
+
     def tie_weights(self):
+        """Ties lm_head weights to the input token embedding matrix.
+
+        Weight tying means lm_head.weight and embed_tokens.weight point to
+        the exact same tensor in memory. The intuition:
+
+            Input side:  token ID  → embedding vector  (embed_tokens)
+            Output side: hidden vector → token scores  (lm_head)
+
+        Both operations are conceptually inverses of each other, so sharing
+        the matrix works well in practice and halves the parameter count for
+        this large matrix (vocab_size × hidden_size).
+
+        After calling this, updating one automatically updates the other.
+        """
         self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(
@@ -400,9 +663,45 @@ class GemmaForCausalLM(nn.Module):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple:
+        """Runs the decoder stack and projects outputs to vocabulary logits.
 
-        # input_embeds: [Batch_Size, Seq_Len, Hidden_Size]
-        # outputs: [Batch_Size, Seq_Len, Hidden_Size]
+        Note that this method receives inputs_embeds (already-embedded
+        vectors), NOT raw input_ids. The embedding step and image/text
+        merging happen upstream in PaliGemmaForConditionalGeneration before
+        this is called.
+
+        Args:
+            attention_mask (torch.Tensor, optional): Additive causal mask of
+                shape ``(batch_size, num_heads, seq_len_q, seq_len_kv)``.
+                Built by _merge_input_ids_with_image_features upstream.
+            position_ids (torch.LongTensor, optional): Token positions of
+                shape ``(batch_size, seq_len)``. Used by RoPE inside each
+                attention layer.
+            inputs_embeds (torch.FloatTensor, optional): Pre-computed token
+                embeddings of shape ``(batch_size, seq_len, hidden_size)``.
+                Contains the merged image patch vectors and text token vectors.
+            kv_cache (KVCache, optional): Cache of past K/V tensors. If
+                provided, only the new token needs to be processed on each
+                generation step rather than the full sequence.
+
+        Returns:
+            dict: Always contains:
+                - **logits** ``(batch_size, seq_len, vocab_size)`` as float32:
+                  Raw unnormalised scores for every vocabulary token at every
+                  sequence position. To get the next token, take
+                  ``logits[:, -1, :].argmax(-1)``.
+
+            If ``kv_cache`` is not None, also contains:
+                - **kv_cache** (KVCache): The updated cache with the current
+                  step's K/V tensors appended. Passed back to the caller so
+                  it can be reused on the next generation step.
+        """
+
+        # Run the full transformer decoder stack.
+        # inputs_embeds: [Batch_Size, Seq_Len, Hidden_Size]
+        # outputs:       [Batch_Size, Seq_Len, Hidden_Size]
+        # Each position's hidden vector now encodes information from all
+        # previous positions (via causal attention) and itself.
         outputs = self.model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -410,8 +709,15 @@ class GemmaForCausalLM(nn.Module):
             kv_cache=kv_cache,
         )
 
-        hidden_states = outputs
+        hidden_states = outputs  # [Batch_Size, Seq_Len, Hidden_Size]
+
+        # Project each hidden vector to a score for every vocabulary token.
+        # This is the "what comes next?" question asked at every position.
+        # [Batch_Size, Seq_Len, Hidden_Size] -> [Batch_Size, Seq_Len, Vocab_Size]
         logits = self.lm_head(hidden_states)
+
+        # Cast to float32 for numerical stability during sampling/argmax,
+        # even if the model ran in bfloat16 or float16.
         logits = logits.float()
 
         return_data = {
@@ -419,7 +725,8 @@ class GemmaForCausalLM(nn.Module):
         }
 
         if kv_cache is not None:
-            # Return the updated cache
+            # Return the updated KV cache so the caller can reuse it on the
+            # next generation step without reprocessing past tokens.
             return_data["kv_cache"] = kv_cache
 
         return return_data
