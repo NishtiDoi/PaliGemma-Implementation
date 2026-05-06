@@ -1,53 +1,62 @@
-# PaliGemma: A Multimodal Vision-Language Transformer
+# 🌟 PaliGemma: Custom PyTorch Inference
 
-This project implements a **multimodal vision-language model** called **PaliGemma** using PyTorch. The model processes both **images and text** to perform tasks such as **image captioning** or **visual question answering**.
+A from-scratch, custom PyTorch implementation for running inference on **PaliGemma**, Google's open-weights Vision-Language Model (VLM). 
 
-## 🔍 Overview
+This project breaks down the PaliGemma architecture into its core foundational components, allowing you to understand exactly how images and text are stitched together, how the KV-cache is managed, and how autoregressive generation works without relying on the black-box abstractions of high-level libraries.
 
-- **Vision Encoder**: Based on **SigLIP**, a contrastive vision model using a Vision Transformer (ViT) backbone.
-- **Language Decoder**: A **transformer-based decoder** called **Gemma**.
-- **Training Paradigm**: Follows **contrastive learning** principles (like CLIP) to align image and text embeddings.
-- **Inference Capabilities**: Supports generation using **temperature, top-p sampling**, and **KV caching** for efficient decoding.
+## 🧠 Architecture Overview
 
----
+PaliGemma connects a Vision Transformer to a Large Language Model:
+1. **Vision Encoder (SigLIP)**: Processes images into patch embeddings natively.
+2. **Text Decoder (Gemma)**: A causal language model using Grouped Query Attention (GQA), Rotary Positional Embeddings (RoPE), and RMSNorm.
+3. **Multimodal Projector**: A linear layer projecting the SigLIP visual embeddings into the Gemma text embedding space.
 
-## 🧠 Architecture Details
+## 📂 Project Structure
 
-### Vision Encoder (SigLIP)
-- Splits input images into non-overlapping patches.
-- Applies positional embeddings, multi-head self-attention, and feed-forward networks (FFNs).
-- Produces a global image embedding.
-- Trained using **contrastive loss** to align with text.
+* **`launch_inference.sh`**: The simple bash script entry point to configure generation parameters and run the model.
+* **`inference.py`**: The core execution engine. Handles the autoregressive generation loop, token sampling (Top-P and Temperature), and KV-Cache management.
+* **`modeling_gemma.py`**: Deep dive into the Gemma LLM architecture. Includes RoPE, RMSNorm, Multi-Layer Perceptrons, and the wrapper VLM class `PaliGemmaForConditionalGeneration`.
+* **`modelling_siglip.py`**: The implementation of the SigLIP Vision Transformer.
+* **`processing_paligemma.py`**: Combines image resizing, pixel normalization, and text tokenization. Automates the prepending of `<image>` tokens to your prompt.
+* **`utils.py`**: Handles loading local HuggingFace `.safetensors` weights and matching them to our custom PyTorch architecture.
 
-### Language Decoder (Gemma)
-- Transformer decoder using:
-  - **Rotary positional embeddings**
-  - **Grouped Query Attention** for memory efficiency
-  - **RMSNorm** for stability
-  - **KV Cache** for fast autoregressive inference
-- Receives the image embedding as a prefix to the text input.
+## 🚀 Getting Started
 
----
-
-## 🚀 How to Run
-
-### 1. Clone the Repository
+### 1. Set up the Environment
+Create a virtual environment and install the required dependencies:
 ```bash
-git clone https://github.com/<your-username>/PaliGemma.git
-cd PaliGemma
-```
-## 2. Install Dependencies
-```bash
+python3 -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
 ```
-## 3. Download Model Weights
-Place the downloaded HuggingFace-compatible model:
 
-## 4. Prepare Input
-Place your test image as image.png in the root directory (or change the path in launch_inference.sh).
+### 2. Download Model Weights
+Because this is a low-level implementation, it expects the raw model weights saved locally.
+1. Go to the [google/paligemma-3b-pt-224](https://huggingface.co/google/paligemma-3b-pt-224) repository on HuggingFace.
+2. Download the `.safetensors` files, `config.json`, and `tokenizer.json` into a local folder (e.g., `paligemma-weights/`).
 
-Edit the PROMPT in launch_inference.sh to customize the prompt.
+### 3. Provide a Test Image
+Place an image in the project root directory and name it `image.png` (or update the shell script to point to your desired visual input).
 
-##5. Run Inference
+### 4. Configure & Run
+Open `launch_inference.sh` and update the `MODEL_PATH` variable to point to where you downloaded the HuggingFace weights. 
+
 ```bash
-./launch_inference.sh
+# Example update in launch_inference.sh
+MODEL_PATH="./paligemma-weights"
+ONLY_CPU="True" # Set to True if testing on a Mac without CUDA 
+```
+
+Then, run the inference instance:
+```bash
+bash launch_inference.sh
+```
+
+## ⚙️ Generation Parameters
+
+You can freely tweak the generation parameters inside `launch_inference.sh`:
+* `PROMPT`: The textual prompt or question.
+* `MAX_TOKENS_TO_GENERATE`: Stop generating after this many tokens.
+* `TEMPERATURE`: The randomness of the generation (lower is strictly more factual, higher is more creative).
+* `TOP_P`: Nucleus sampling threshold.
+* `DO_SAMPLE`: Set to `"False"` for greedy decoding, or `"True"` to enable Top-P & Temperature sampling.
